@@ -6,12 +6,42 @@ from array import array
 GREP_STRING = "AccessKeyId"
 GREP_STRING_BYTES = bytearray(GREP_STRING)
 
-class BurpExtender(IBurpExtender, IScannerCheck):
-
+##### Helper Functions #####
+def _consolidateDuplicateIssues(existingIssue, newIssue):
+    # This method is called when multiple issues are reported for the same URL
+    # path by the same extension-provided check. The value we return from this
+    # method determines how/whether Burp consolidates the multiple issues
+    # to prevent duplication
     #
-    # implement IBurpExtender
-    #
+    # Since the issue name is sufficient to identify our issues as different,
+    # if both issues have the same name, only report the existing issue
+    # otherwise report both issues
+    if existingIssue.getIssueName() == newIssue.getIssueName():
+        return -1
+    return 0
 
+
+def _get_matches(helpers, response, match):
+    ''' helper method to search a response for occurrences of a literal match
+        string and return a list of start/end offsets
+    '''
+    matches = []
+    start = 0
+    reslen = len(response)
+    matchlen = len(match)
+    while start < reslen:
+        start = helpers.indexOf(response, match, True, start, reslen)
+        if start == -1:
+            break
+        matches.append(array('i', [start, start + matchlen]))
+        start += matchlen
+
+    return matches
+
+##### BurpExtender Class #####
+class BurpExtender(IBurpExtender):
+    ''' implement IBurpExtender
+    '''
     def registerExtenderCallbacks(self, callbacks):
         # keep a reference to our callbacks object
         self.callbacks = callbacks
@@ -23,35 +53,11 @@ class BurpExtender(IBurpExtender, IScannerCheck):
         callbacks.setExtensionName("AWS Hunter")
         print("AWS Hunter")
 
-        # register ourselves as a custom scanner check
-        #callbacks.registerScannerCheck(self)
+        # Register Scanner Checks
         callbacks.registerScannerCheck(AwsSecrets(self.callbacks, self.helpers))
+        callbacks.registerScannerCheck(FindAwsEndpoints(self.callbacks, self.helpers))
 
-
-    #
-    # implement IScannerCheck
-    #
-
-    def doPassiveScan(self, baseRequestResponse):
-        return None
-
-    def doActiveScan(self, baseRequestResponse):
-        return None
-
-    def consolidateDuplicateIssues(self, existingIssue, newIssue):
-        # This method is called when multiple issues are reported for the same URL
-        # path by the same extension-provided check. The value we return from this
-        # method determines how/whether Burp consolidates the multiple issues
-        # to prevent duplication
-        #
-        # Since the issue name is sufficient to identify our issues as different,
-        # if both issues have the same name, only report the existing issue
-        # otherwise report both issues
-        if existingIssue.getIssueName() == newIssue.getIssueName():
-            return -1
-
-        return 0
-
+##### Scanner Checks #####
 class AwsSecrets(IScannerCheck):
     def __init__(self, callbacks, helpers):
         print("AwsSecrets: setting callbacks to {}".format(callbacks))
@@ -67,20 +73,22 @@ class AwsSecrets(IScannerCheck):
         access_key_matches = []
         for token in ["AccessKeyId"]:
             token_bytes = bytearray(token)
-            access_key_matches = access_key_matches + self._get_matches(baseRequestResponse.getResponse(), token_bytes)
+            access_key_matches = access_key_matches + _get_matches(
+                self.helpers, baseRequestResponse.getResponse(), token_bytes)
             if (len(access_key_matches) > 0):
-                print("AWS Access Key found")
-                title = "AWS Access Key found"
+                print("AWS access key found")
+                title = "AWS access key found"
                 description = "An AWS Access Key was detected. By itself, this likely indicates readonly access to an S3 object."
                 severity = "Medium"
 
         secret_key_matches = []
         for token in ["SecretAccessKey", "SessionToken"]:
             token_bytes = bytearray(token)
-            secret_key_matches = secret_key_matches + self._get_matches(baseRequestResponse.getResponse(), token_bytes)
+            secret_key_matches = secret_key_matches + _get_matches(
+                self.helpers, baseRequestResponse.getResponse(), token_bytes)
             if (len(secret_key_matches) > 0):
-                print("AWS Secret Key found")
-                title = "AWS Secret Key found"
+                print("AWS secret key found")
+                title = "AWS secret key found"
                 description = "An AWS Secret Key was detected."
                 severity = "High"
 
@@ -101,35 +109,47 @@ class AwsSecrets(IScannerCheck):
         return None
 
     def consolidateDuplicateIssues(self, existingIssue, newIssue):
-        # This method is called when multiple issues are reported for the same URL
-        # path by the same extension-provided check. The value we return from this
-        # method determines how/whether Burp consolidates the multiple issues
-        # to prevent duplication
-        #
-        # Since the issue name is sufficient to identify our issues as different,
-        # if both issues have the same name, only report the existing issue
-        # otherwise report both issues
-        if existingIssue.getIssueName() == newIssue.getIssueName():
-            return -1
+        return _consolidateDuplicateIssues(existingIssue, newIssue)
 
-        return 0
+class FindAwsEndpoints(IScannerCheck):
+    def __init__(self, callbacks, helpers):
+        self.callbacks = callbacks
+        self.helpers = helpers
 
-    # helper method to search a response for occurrences of a literal match string
-    # and return a list of start/end offsets
+    def doPassiveScan(self, baseRequestResponse):
+        title = None
+        description = None
+        severity = None
 
-    def _get_matches(self, response, match):
-        matches = []
-        start = 0
-        reslen = len(response)
-        matchlen = len(match)
-        while start < reslen:
-            start = self.helpers.indexOf(response, match, True, start, reslen)
-            if start == -1:
-                break
-            matches.append(array('i', [start, start + matchlen]))
-            start += matchlen
+        # Look for S3 buckets in urls
+        text_matches = []
+        for token in [".amazonaws.com"]:
+            token_bytes = bytearray(token)
+            text_matches = _get_matches(
+                self.helpers, baseRequestResponse.getResponse(), token_bytes)
+            if (len(text_matches) > 0):
+                print("AWS Endpoint Found")
+                title = "AWS endpoint found"
+                description = "Potential S3 bucket discovered"
+                severity = "Low"
 
-        return matches
+        # Report if needed
+        if title:
+            # Report the issue
+            return [CustomScanIssue(
+                baseRequestResponse.getHttpService(),
+                self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
+                [self.callbacks.applyMarkers(baseRequestResponse, None, text_matches)],
+                title,
+                description,
+                severity)]
+        return None
+
+    def doActiveScan(self, baseRequestResponse):
+        return None
+
+    def consolidateDuplicateIssues(self, existingIssue, newIssue):
+        return _consolidateDuplicateIssues(existingIssue, newIssue)
 
 #
 # class implementing IScanIssue to hold our custom scan issue details
