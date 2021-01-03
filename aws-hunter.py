@@ -96,7 +96,7 @@ class AwsSecrets(IScannerCheck):
         if title:
             matches = access_key_matches + secret_key_matches
             # report the issue
-            return [CustomScanIssue(
+            return [CustomScanIssueBase(
                 baseRequestResponse.getHttpService(),
                 self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
                 [self.callbacks.applyMarkers(baseRequestResponse, None, matches)],
@@ -120,30 +120,26 @@ class FindAwsEndpoints(IScannerCheck):
         title = None
         description = None
         severity = None
+        issues = []
 
-        # Look for S3 buckets in urls
-        text_matches = []
+        # Request checks
+        request_matches = []
+        response_matches = []
+
         for token in [".amazonaws.com"]:
             token_bytes = bytearray(token)
-            text_matches = _get_matches(
+            request_matches = request_matches + _get_matches(
+                self.helpers, baseRequestResponse.getRequest(), token_bytes)
+            response_matches = response_matches + _get_matches(
                 self.helpers, baseRequestResponse.getResponse(), token_bytes)
-            if (len(text_matches) > 0):
-                print("AWS Endpoint Found")
-                title = "AWS endpoint found"
-                description = "Potential S3 bucket discovered"
-                severity = "Low"
-
-        # Report if needed
-        if title:
-            # Report the issue
-            return [CustomScanIssue(
+        if request_matches or response_matches:
+            print("AWS Endpoint Found")
+            issues.append(AwsEndpointScanIssue(
                 baseRequestResponse.getHttpService(),
                 self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
-                [self.callbacks.applyMarkers(baseRequestResponse, None, text_matches)],
-                title,
-                description,
-                severity)]
-        return None
+                [self.callbacks.applyMarkers(baseRequestResponse, request_matches, response_matches)],
+                ))
+        return issues
 
     def doActiveScan(self, baseRequestResponse):
         return None
@@ -154,14 +150,15 @@ class FindAwsEndpoints(IScannerCheck):
 #
 # class implementing IScanIssue to hold our custom scan issue details
 #
-class CustomScanIssue (IScanIssue):
-    def __init__(self, httpService, url, httpMessages, name, detail, severity):
+class CustomScanIssueBase (IScanIssue):
+    def __init__(self, httpService, url, httpMessages, name, detail, severity="Low", confidence="Certain"):
         self._httpService = httpService
         self._url = url
         self._httpMessages = httpMessages
         self._name = name
         self._detail = detail
         self._severity = severity
+        self._confidence = confidence
 
     def getUrl(self):
         return self._url
@@ -176,7 +173,7 @@ class CustomScanIssue (IScanIssue):
         return self._severity
 
     def getConfidence(self):
-        return "Certain"
+        return self._confidence
 
     def getIssueBackground(self):
         pass
@@ -195,3 +192,14 @@ class CustomScanIssue (IScanIssue):
 
     def getHttpService(self):
         return self._httpService
+
+class AwsEndpointScanIssue (CustomScanIssueBase):
+    def __init__(self, httpService, url, httpMessages):
+        super(CustomScanIssueBase, self).__init__()
+        self._httpService = httpService
+        self._url = url
+        self._httpMessages = httpMessages
+        self._name = "AWS endpoint found"
+        self._detail = "An endpoint was found ending in .amazonaws.com, indicating that the organization is using an Amazon service."
+        self._severity = "Low"
+        self._confidence = "Firm"
