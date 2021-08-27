@@ -3,8 +3,28 @@ from burp import IScannerCheck
 from burp import IScanIssue
 from array import array
 
-GREP_STRING = "AccessKeyId"
-GREP_STRING_BYTES = bytearray(GREP_STRING)
+ACCESS_KEYS = [
+    "AWS_ACCESS_KEY_ID",        # Environment variable
+    "aws_access_key_id",        # Credentials file
+    "X-Amz-Security-Token",     # S3 Presigned URL
+    "X-Amz-Credential",         # S3 Presigned URL
+    "AccessKeyId"               # Found in the wild
+]
+SECRET_KEYS = [
+    "AWS_SECRET_ACCESS_KEY",    # Environment variable
+    "AWS_SESSION_TOKEN",        # Environment variable
+    "aws_secret_access_key",    # Credentials file
+    "aws_session_token",        # Credentials file
+    "SecretAccessKey",          # Found in the wild
+    "SessionToken"              # Found in the wild
+]
+AWS_ENDPOINTS = [
+    ".amazonaws.com",
+    "Server: AmazonS3"
+]
+CLOUDFRONT_ENDPOINTS = [
+    ".cloudfront.net"
+]
 
 ##### Helper Functions #####
 def _consolidateDuplicateIssues(existingIssue, newIssue):
@@ -38,6 +58,16 @@ def _get_matches(helpers, response, match):
 
     return matches
 
+def _get_match_key(match_array):
+    ''' Get the first number in a match array, so matches can be sorted
+    '''
+    return match_array[0]
+
+def _sort_matches(matches):
+    ''' Sorts a list of match arrays
+    '''
+    matches.sort(key=_get_match_key)
+
 ##### BurpExtender Class #####
 class BurpExtender(IBurpExtender):
     ''' implement IBurpExtender
@@ -56,11 +86,12 @@ class BurpExtender(IBurpExtender):
         # Register Scanner Checks
         callbacks.registerScannerCheck(AwsSecrets(self.callbacks, self.helpers))
         callbacks.registerScannerCheck(FindAwsEndpoints(self.callbacks, self.helpers))
+        callbacks.registerScannerCheck(FindCloudfrontEndpoints(self.callbacks, self.helpers))
+
 
 ##### Scanner Checks #####
 class AwsSecrets(IScannerCheck):
     def __init__(self, callbacks, helpers):
-        print("AwsSecrets: setting callbacks to {}".format(callbacks))
         self.callbacks = callbacks
         self.helpers = helpers
 
@@ -70,36 +101,52 @@ class AwsSecrets(IScannerCheck):
         severity = None
 
         # First look for access keys
-        access_key_matches = []
-        for token in ["AccessKeyId"]:
+        access_key_request_matches = []
+        access_key_response_matches = []
+        print(self.helpers.analyzeRequest(baseRequestResponse).getUrl())
+        for token in ACCESS_KEYS:
             token_bytes = bytearray(token)
-            access_key_matches = access_key_matches + _get_matches(
+            access_key_request_matches = access_key_request_matches + _get_matches(
+                self.helpers, baseRequestResponse.getRequest(), token_bytes)
+            access_key_response_matches = access_key_response_matches + _get_matches(
                 self.helpers, baseRequestResponse.getResponse(), token_bytes)
-            if (len(access_key_matches) > 0):
-                print("AWS access key found")
-                title = "AWS access key found"
-                description = "An AWS Access Key was detected. By itself, this likely indicates readonly access to an S3 object."
-                severity = "Medium"
+        if (len(access_key_request_matches) > 0) or (len(access_key_response_matches) > 0):
+            print("AWS access key found in {}".format(
+                self.helpers.analyzeRequest(baseRequestResponse).getUrl()
+            ))
+            title = "[AWS access key found]"
+            description = "An AWS Access Key was detected. By itself, this likely indicates readonly access to an S3 object."
+            severity = "Medium"
+            #baseRequestResponse.setHighlight('orange')
 
-        secret_key_matches = []
-        for token in ["SecretAccessKey", "SessionToken"]:
+        secret_key_request_matches = []
+        secret_key_response_matches = []
+        for token in SECRET_KEYS:
             token_bytes = bytearray(token)
-            secret_key_matches = secret_key_matches + _get_matches(
+            secret_key_request_matches = secret_key_request_matches + _get_matches(
+                self.helpers, baseRequestResponse.getRequest(), token_bytes)
+            secret_key_response_matches = secret_key_response_matches + _get_matches(
                 self.helpers, baseRequestResponse.getResponse(), token_bytes)
-            if (len(secret_key_matches) > 0):
-                print("AWS secret key found")
-                title = "AWS secret key found"
-                description = "An AWS Secret Key was detected."
-                severity = "High"
+        if (len(secret_key_request_matches) > 0) or (len(secret_key_response_matches) > 0):
+            print("AWS secret key found in {}".format(
+                self.helpers.analyzeRequest(baseRequestResponse).getUrl()
+            ))
+            title = "[AWS secret key found]"
+            description = "An AWS Secret Key was detected."
+            severity = "High"
+            #baseRequestResponse.setHighlight('red')
 
         # Report if needed
-        if title:
-            matches = access_key_matches + secret_key_matches
+        request_matches = access_key_request_matches + secret_key_request_matches
+        response_matches = access_key_response_matches + secret_key_response_matches
+        if (len(request_matches) > 0) or (len(response_matches) > 0):
+            _sort_matches(request_matches)
+            _sort_matches(response_matches)
             # report the issue
             return [CustomScanIssueBase(
                 baseRequestResponse.getHttpService(),
                 self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
-                [self.callbacks.applyMarkers(baseRequestResponse, None, matches)],
+                [self.callbacks.applyMarkers(baseRequestResponse, request_matches, response_matches)],
                 title,
                 description,
                 severity)]
@@ -126,7 +173,7 @@ class FindAwsEndpoints(IScannerCheck):
         request_matches = []
         response_matches = []
 
-        for token in [".amazonaws.com"]:
+        for token in AWS_ENDPOINTS:
             token_bytes = bytearray(token)
             request_matches = request_matches + _get_matches(
                 self.helpers, baseRequestResponse.getRequest(), token_bytes)
@@ -135,6 +182,43 @@ class FindAwsEndpoints(IScannerCheck):
         if request_matches or response_matches:
             print("AWS Endpoint Found")
             issues.append(AwsEndpointScanIssue(
+                baseRequestResponse.getHttpService(),
+                self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
+                [self.callbacks.applyMarkers(baseRequestResponse, request_matches, response_matches)],
+                ))
+            #baseRequestResponse.setHighlight('blue')
+        return issues
+
+    def doActiveScan(self, baseRequestResponse):
+        return None
+
+    def consolidateDuplicateIssues(self, existingIssue, newIssue):
+        return _consolidateDuplicateIssues(existingIssue, newIssue)
+
+class FindCloudfrontEndpoints(IScannerCheck):
+    def __init__(self, callbacks, helpers):
+        self.callbacks = callbacks
+        self.helpers = helpers
+
+    def doPassiveScan(self, baseRequestResponse):
+        title = None
+        description = None
+        severity = None
+        issues = []
+
+        # Request checks
+        request_matches = []
+        response_matches = []
+
+        for token in CLOUDFRONT_ENDPOINTS:
+            token_bytes = bytearray(token)
+            request_matches = request_matches + _get_matches(
+                self.helpers, baseRequestResponse.getRequest(), token_bytes)
+            response_matches = response_matches + _get_matches(
+                self.helpers, baseRequestResponse.getResponse(), token_bytes)
+        if request_matches or response_matches:
+            print("CloudFront Distribution Found")
+            issues.append(AwsCloudfrontScanIssue(
                 baseRequestResponse.getHttpService(),
                 self.helpers.analyzeRequest(baseRequestResponse).getUrl(),
                 [self.callbacks.applyMarkers(baseRequestResponse, request_matches, response_matches)],
@@ -199,7 +283,18 @@ class AwsEndpointScanIssue (CustomScanIssueBase):
         self._httpService = httpService
         self._url = url
         self._httpMessages = httpMessages
-        self._name = "AWS endpoint found"
+        self._name = "[AWS endpoint found]"
         self._detail = "An endpoint was found ending in .amazonaws.com, indicating that the organization is using an Amazon service."
         self._severity = "Low"
         self._confidence = "Firm"
+
+class AwsCloudfrontScanIssue (CustomScanIssueBase):
+    def __init__(self, httpService, url, httpMessages):
+        super(CustomScanIssueBase, self).__init__()
+        self._httpService = httpService
+        self._url = url
+        self._httpMessages = httpMessages
+        self._name = "[AWS Cloudfront distribution found]"
+        self._detail = "An endpoint was found ending in .amazonaws.com, indicating that the organization is using an Amazon service."
+        self._severity = "Information"
+        self._confidence = "Certain"
